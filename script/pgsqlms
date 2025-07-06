@@ -102,6 +102,140 @@ my $max_election_participants = $ENV{'OCF_RESKEY_max_election_participants'} || 
 my %db_connections;
 my $connection_timeout = 30;
 
+my $batch_processing_enabled = $ENV{'OCF_RESKEY_enable_batching'} || 'true';
+my $batch_size_limit = $ENV{'OCF_RESKEY_batch_size'} || 10;
+
+# Enhanced query function with result caching
+my %query_cache;
+my $query_cache_ttl = 2; # 2 seconds for frequent queries
+
+sub min {
+    my ($a, $b) = @_;
+    return $a < $b ? $a : $b;
+}
+
+# Resource coordination and batching
+sub _is_batch_coordinator {
+    # Determine if this instance should coordinate batch operations
+    # Use lowest port number as coordinator for deterministic selection
+    return unless $batch_processing_enabled eq 'true';
+    
+    my @all_instances = _get_all_resource_instances();
+    my $min_port = (sort { $a <=> $b } map { _extract_port($_) } @all_instances)[0];
+    
+    return $pgport == $min_port;
+}
+
+sub _get_all_resource_instances {
+    # Get all pgsqlms instances in the cluster
+    my $instances_output = qx{ $CRM_RESOURCE --list 2>/dev/null | grep pgsqlms };
+    my @instances;
+    
+    for my $line (split /\n/, $instances_output) {
+        if ($line =~ /(\w+)\s+.*pgsqlms/) {
+            push @instances, $1;
+        }
+    }
+    
+    return @instances;
+}
+
+sub _extract_port {
+    my ($instance) = @_;
+    # Extract port from resource configuration
+    my $port_info = qx{ $CRM_RESOURCE --resource $instance --get-parameter pgport 2>/dev/null };
+    chomp $port_info;
+    return $port_info || 5432;
+}
+
+# Batched monitoring coordinator
+sub _coordinate_batch_monitoring {
+    return unless _is_batch_coordinator();
+    
+    my @all_instances = _get_all_resource_instances();
+    my @batch_results;
+    my @batch_updates;
+    
+    ocf_log('info', 'Coordinating batch monitoring for %d instances', scalar(@all_instances));
+    
+    # Collect monitoring data from all instances
+    for my $instance (@all_instances) {
+        my $instance_data = _collect_instance_monitoring_data($instance);
+        push @batch_results, $instance_data if $instance_data;
+    }
+    
+    # Process lag scores in batch
+    my $lag_scores = _batch_process_lag_scores(@batch_results);
+    
+    # Generate batch attribute updates
+    for my $result (@batch_results) {
+        my $score_updates = _calculate_batch_scores($result, $lag_scores);
+       push @batch_updates, @$score_updates if $score_updates;
+    }
+    
+    # Execute all updates in single batch
+    _batch_set_attributes(\@batch_updates) if @batch_updates;
+    
+    # Store coordination timestamp
+    _set_priv_attr('last_batch_coordination', time());
+
+    return $OCF_SUCCESS;
+}
+
+sub _collect_instance_monitoring_data {
+    my ($instance) = @_;
+    
+    # Get instance configuration
+    my $instance_port = _extract_port($instance);
+    my $instance_host = qx{ $CRM_RESOURCE --resource $instance --get-parameter pghost 2>/dev/null } || '/tmp';
+    chomp $instance_host;
+    
+    # Quick connectivity check
+    my $conn_check = qx{ $PGISREADY -h '$instance_host' -p $instance_port -t 2 2>/dev/null };
+    return undef unless $? == 0;
+    
+    # Collect replication data for this instance
+    my @replication_data;
+    my $query_result = _query_instance_replication($instance_host, $instance_port);
+    
+    return {
+        instance => $instance,
+        port => $instance_port,
+        host => $instance_host,
+        replication_data => $query_result,
+        timestamp => time()
+    };
+}
+
+sub _query_instance_replication {
+    my ($host, $port) = @_;
+    
+    # Use connection pooling for batch queries
+    my $conn_key = "$host:$port";
+    
+    # Build optimized query for this PostgreSQL version
+    my $query = _build_lag_query();
+    
+    # Execute with shorter timeout for batch processing
+    local $ENV{PGCONNECT_TIMEOUT} = 5;
+    
+    my @results;
+    my $rc = _query_with_host_port($query, \@results, $host, $port);
+    
+    return ($rc == 0) ? \@results : [];
+}
+
+sub _query_with_host_port {
+    my ($query, $res, $host, $port) = @_;
+    my $connstr = "dbname=postgres host=$host port=$port";
+    
+    # Use existing _query mechanism but with custom connection
+    local $pghost = $host;
+    local $pgport = $port;
+    
+    return _query($query, $res);
+}
+
 # Memory management and cleanup
 sub _cleanup_caches {
     my $now = time();
@@ -141,22 +275,6 @@ sub _periodic_maintenance {
     }
 }
 
-# Enhanced _get_lag_scores with optimizations
-sub _get_lag_scores_optimized {
-    my $cache_key = "lag_scores_$pgport";
-    my @rs;
-    
-    # Use cached version for frequent calls
-    my $rc = _cached_query(_build_lag_query(), \@rs, $cache_key);
-    
-    if ($rc != 0) {
-        ocf_exit_reason('Query to get standby locations failed (%d)', $rc);
-        exit $OCF_ERR_GENERIC;
-    }
-    
-    return \@rs;
-}
-
 # Build lag query dynamically based on PostgreSQL version
 sub _build_lag_query {
     my $pg_current_wal_lsn = 'pg_current_wal_lsn()';
@@ -192,83 +310,6 @@ sub _build_lag_query {
     };
 }
 
-# Resource group management
-sub _get_group_nodes {
-    my $group = shift || $resource_group;
-    my @all_nodes = split /\s+/, qx{ $CRM_NODE --partition };
-    my @group_nodes;
-    
-    # Filter nodes by group (would check node attributes in real implementation)
-    for my $node (@all_nodes) {
-        my $node_group = _get_node_attribute($node, 'resource_group') || 'default';
-        push @group_nodes, $node if $node_group eq $group;
-    }
-    
-    return @group_nodes;
-}
-
-# Get node attribute (simplified implementation)
-sub _get_node_attribute {
-    my ($node, $attr) = @_;
-    # In real implementation, would query cluster attributes
-    # For now, return default group for all nodes
-    return 'default';
-}
-
-# Cross-group coordination for critical operations
-sub _coordinate_cross_group {
-    my ($operation) = @_;
-    
-    # Only coordinate for major operations like cluster startup
-    return 1 unless $operation eq 'startup' || $operation eq 'failover';
-    
-    my @all_groups = _get_all_resource_groups();
-    my $coordination_needed = scalar(@all_groups) > 1;
-    
-    return 1 unless $coordination_needed;
-    
-    # Implement coordination logic here
-    ocf_log('info', 'Cross-group coordination for %s', $operation);
-    
-    return 1;
-}
-
-sub _get_pooled_connection {
-    my $conn_key = "$pghost:$pgport";
-    my $now = time();
-    
-    # Check if existing connection is still valid
-    if (exists $db_connections{$conn_key} && 
-        ($now - $db_connections{$conn_key}{created}) < $connection_timeout) {
-        return $db_connections{$conn_key}{handle};
-    }
-    
-    # Create new connection (simplified - would use DBI in real implementation)
-    # For now, return undef to use existing _query mechanism
-    return undef;
-}
-
-# Adaptive monitoring intervals based on cluster size
-sub _get_adaptive_monitor_interval {
-    my $cluster_size = scalar(split /\s+/, qx{ $CRM_NODE --partition });
-    my $base_interval = 15; # seconds
-    
-    # Increase interval for larger clusters
-    if ($cluster_size > 100) {
-        return $base_interval * 4;
-    } elsif ($cluster_size > 50) {
-        return $base_interval * 2;
-    } elsif ($cluster_size > 20) {
-        return int($base_interval * 1.5);
-    }
-    
-    return $base_interval;
-}
-
-# Enhanced query function with result caching
-my %query_cache;
-my $query_cache_ttl = 2; # 2 seconds for frequent queries
-
 sub _cached_query {
     my ($query, $res, $cache_key) = @_;
     my $now = time();
@@ -295,27 +336,6 @@ sub _cached_query {
     }
     
     return $rc;
-}
-
-# Replace _check_locations with optimized version
-sub _check_locations_scaled {
-    my $cluster_size = scalar(split /\s+/, qx{ $CRM_NODE --partition });
-    
-    # Use sampling for large clusters
-    if ($cluster_size > 50) {
-        return _check_locations_sampled();
-    } else {
-        return _check_locations_optimized();
-    }
-}
-
-# Sampled monitoring for very large clusters
-sub _check_locations_sampled {
-    my $sample_size = min(20, int($cluster_size / 5));
-    my @all_nodes = split /\s+/, qx{ $CRM_NODE --partition };
-    my @sample_nodes = _select_sample_nodes(\@all_nodes, $sample_size);
-    
-    return _check_specific_nodes(@sample_nodes);
 }
 
 # Optimized version with batched operations
@@ -379,10 +399,120 @@ sub _calculate_new_score {
 
 # Hierarchical election coordinator
 sub _coordinate_election {
+    # Check if batch coordination is enabled
+    if ($batch_processing_enabled eq 'true') {
+        return _coordinate_batch_election();
+    } else {
+        return _coordinate_individual_election();
+    }
+}
+
+sub _coordinate_batch_election {
+    my @all_instances = _get_all_resource_instances();
+    my $resource_count = scalar(@all_instances);
+    
+    ocf_log('info', 'Coordinating election across %d PostgreSQL resources', $resource_count);
+    
+    # For large numbers of resources, use staged election
+    if ($resource_count > 50) {
+        return _coordinate_staged_election(@all_instances);
+    } else {
+        return _coordinate_group_election(@all_instances);
+    }
+}
+
+sub _coordinate_group_election {
+    my @instances = @_;
+    # Simplified group election - delegate to individual election
+    return _coordinate_individual_election();
+}
+
+sub _coordinate_staged_election {
+    my @all_instances = @_;
+    
+    # Stage 1: Elect regional coordinators
+    my @regional_coordinators = _elect_regional_coordinators(@all_instances);
+    
+    # Stage 2: Coordinators elect final candidate
+    if (grep { $_ eq $OCF_RESOURCE_INSTANCE } @regional_coordinators) {
+        return _participate_in_coordinator_election(@regional_coordinators);
+    }
+    
+    # Stage 3: Non-coordinators defer to coordinator decision
+    return _defer_to_coordinator_decision();
+}
+
+sub _elect_regional_coordinators {
+    my @all_instances = @_;
+    my $groups_count = int(scalar(@all_instances) / 10) + 1;
+    my @coordinators;
+    
+    # Group instances by port ranges for regional coordination
+    my @sorted_instances = sort { _extract_port($a) <=> _extract_port($b) } @all_instances;
+    
+    for my $group_id (0..$groups_count-1) {
+        my $start_idx = $group_id * 10;
+        my $end_idx = min($start_idx + 9, $#sorted_instances);
+        
+        if ($start_idx <= $#sorted_instances) {
+            # Lowest port in group becomes coordinator
+            push @coordinators, $sorted_instances[$start_idx];
+        }
+    }
+    
+    return @coordinators;
+}
+
+sub _participate_in_coordinator_election {
+    my @coordinators = @_;
+    
+    # Use existing election logic but only among coordinators
+    my @candidates = _select_election_candidates_from_list(@coordinators);
+    my $best_candidate = _find_best_candidate(@candidates);
+    
+    if ($best_candidate eq $OCF_RESOURCE_INSTANCE) {
+        ocf_log('info', 'This resource elected as coordinator winner');
+        return 1;
+    } else {
+        ocf_log('info', 'Coordinator election won by: %s', $best_candidate);
+        return 0;
+    }
+}
+
+sub _select_election_candidates_from_list {
+    my @candidates = @_;
+    # Return top candidates based on max_election_participants
+    my $max = min($max_election_participants, scalar(@candidates));
+    return splice(@candidates, 0, $max);
+}
+
+sub _find_best_candidate {
+    my @candidates = @_;
+    return $candidates[0] || $nodename;
+}
+
+sub _defer_to_coordinator_decision {
+    # Check if coordinator has made a decision
+    my $coordinator_decision = _get_priv_attr('coordinator_election_result');
+    
+    if ($coordinator_decision) {
+        my ($winner, $timestamp) = split /#/, $coordinator_decision;
+        my $now = time();
+        
+        # Decision is valid for 60 seconds
+        if (($now - $timestamp) < 60) {
+            return ($winner eq $OCF_RESOURCE_INSTANCE) ? 1 : 0;
+        }
+    }
+    
+    # No recent coordinator decision, fall back to individual election
+    return _coordinate_individual_election();
+}
+
+sub _coordinate_individual_election {
+    # Original election logic for smaller clusters
     my @all_nodes = split /\s+/ => qx{ $CRM_NODE --partition };
     my @candidates = _select_election_candidates(@all_nodes);
-    
-    ocf_log('info', 'Election participants: %s', join(',', @candidates));
     
     # Only proceed if this node is a candidate
     return 0 unless grep { $_ eq $nodename } @candidates;
@@ -453,24 +583,71 @@ sub _batch_set_attributes {
     my ($updates) = @_;
     return unless @$updates;
     
-    # Group updates by node
-    my %node_updates;
+    # Group updates by operation type for efficiency
+    my %grouped_updates;
     for my $update (@$updates) {
         my ($name, $val, $node) = @$update;
         $node ||= '';
-        push @{$node_updates{$node}}, "$name-$OCF_RESOURCE_INSTANCE=$val";
+        my $group_key = $node || 'local';
+        push @{$grouped_updates{$group_key}}, "$name=$val";
     }
     
-    # Execute batched updates
-    for my $node (keys %node_updates) {
-        my $node_arg = $node ? "--node $node" : '';
-        my $attrs = join ' ', map { "--name '$_'" } @{$node_updates{$node}};
-        qx{ $ATTRD_PRIV $node_arg --update-batch $attrs };
+    # Execute batched updates with parallel processing
+    my @batch_commands;
+    for my $group (keys %grouped_updates) {
+        my $node_arg = ($group ne 'local') ? "--node $group" : '';
+        my $attrs = join ' ', map { "--update '$_'" } @{$grouped_updates{$group}};
+        
+        # Build command but don't execute yet
+        push @batch_commands, "$ATTRD_PRIV $node_arg $attrs";
     }
+    
+    # Execute commands in parallel for better performance
+    _execute_parallel_commands(@batch_commands);
     
     # Clear pending updates
     @pending_attr_updates = ();
+    
+    ocf_log('debug', 'Batch updated %d attributes across %d nodes', 
+            scalar(@$updates), scalar(keys %grouped_updates));
 }
+
+sub _execute_parallel_commands {
+    my @commands = @_;
+    my @pids;
+    
+    # Limit parallel execution to avoid overwhelming the system
+    my $max_parallel = 5;
+    
+    while (@commands) {
+        # Wait for running processes if we've hit the limit
+        while (@pids >= $max_parallel) {
+            my $finished_pid = wait();
+            @pids = grep { $_ != $finished_pid } @pids;
+        }
+        
+        # Start next command
+        my $cmd = shift @commands;
+        my $pid = fork();
+        
+        if ($pid == 0) {
+            # Child process
+            exec("$cmd >/dev/null 2>&1");
+            exit(0);
+        } elsif ($pid > 0) {
+            # Parent process
+            push @pids, $pid;
+        }
+    }
+    
+    # Wait for all remaining processes
+    while (@pids) {
+        my $finished_pid = wait();
+        @pids = grep { $_ != $finished_pid } @pids;
+    }
+}
+
+
 
 # Enhanced attribute caching with TTL
 sub _cached_get_priv_attr {
@@ -797,10 +974,23 @@ sub _get_master_score {
     return $score;
 }
 
+# Improved master score setting with batching
+sub _set_master_score {
+    my ($score, $node) = @_;
+    
+    if ($batch_processing_enabled eq 'true') {
+        # Add to pending batch instead of immediate update
+        _async_set_priv_attr('master_score', $score, $node);
+    } else {
+        # Use original immediate method for compatibility
+        _set_master_score_immediate($score, $node);
+    }
+}
+
 # Set the master score of the local node or the optionally given node.
 # As setting an attribute is asynchronous, this will return as soon as the
 # attribute is really set by attrd and available everywhere.
-sub _set_master_score {
+sub _set_master_score_immediate {
     my ( $score, $node ) = @_;
     my $node_arg = '';
     my $tmp;
@@ -1134,6 +1324,33 @@ sub _controldata_to_ocf {
 
     return $OCF_ERR_INSTALLED ;
 }
+sub _check_locations {
+    # Check if we should use batch processing
+    if ($batch_processing_enabled eq 'true' && _is_batch_coordinator()) {
+        return _coordinate_batch_monitoring();
+    } elsif ($batch_processing_enabled eq 'true') {
+        # Non-coordinator instances use cached results
+        return _use_cached_batch_results();
+    } else {
+        # Fall back to individual processing for small clusters
+        return _check_locations_individual();
+    }
+}
+
+sub _use_cached_batch_results {
+    # Get coordination timestamp
+    my $last_coordination = _get_priv_attr('last_batch_coordination') || 0;
+    my $now = time();
+    
+    # If coordination is recent (within 30 seconds), skip individual processing
+    if (($now - $last_coordination) < 30) {
+        ocf_log('debug', 'Using recent batch coordination results');
+        return $OCF_SUCCESS;
+    }
+    
+    # Fall back to individual check if coordination is stale
+    return _check_locations_individual();
+}
 
 # Check the write_location of all secondaries, and adapt their master score so
 # that the instance closest to the primary will be the selected candidate
@@ -1149,7 +1366,7 @@ sub _controldata_to_ocf {
 #
 # This sub must be executed from a Master-role monitor action.
 #
-sub _check_locations {
+sub _check_locations_individual {
     my $partition_nodes;
     my $node_score;
     my $row_num;
@@ -1247,6 +1464,50 @@ sub _check_locations {
     return $OCF_SUCCESS;
 }
 
+sub _batch_process_lag_scores {
+    my (@all_instance_data) = @_;
+    my %consolidated_scores;
+    
+    # Consolidate lag information across all instances
+    for my $instance_data (@all_instance_data) {
+        next unless $instance_data->{replication_data};
+        
+        for my $row (@{$instance_data->{replication_data}}) {
+            my $node_name = $row->[0];
+            
+            # Keep the best (lowest lag) score for each node
+            if (!exists $consolidated_scores{$node_name} || 
+                $row->[1] > $consolidated_scores{$node_name}) {
+                $consolidated_scores{$node_name} = $row->[1];
+            }
+        }
+    }
+    
+    return \%consolidated_scores;
+}
+
+sub _calculate_batch_scores {
+    my ($instance_data, $lag_scores) = @_;
+    my @updates;
+    my $instance = $instance_data->{instance};
+    
+    # Generate score updates for this instance's replication data
+    for my $row (@{$instance_data->{replication_data}}) {
+        my $node_name = $row->[0];
+        my $new_score = $row->[1];
+        
+        # Use consolidated lag score if available
+        if (exists $lag_scores->{$node_name}) {
+            $new_score = $lag_scores->{$node_name};
+        }
+        
+        # Add to batch updates
+        push @updates, ["master_score-$instance", $new_score, $node_name];
+    }
+    
+    return \@updates;
+}
+
 # _check_switchover
 # check if the pgsql switchover to the localnode is safe.
 # This is supposed to be called **after** the primary has been stopped or
@@ -1341,7 +1602,7 @@ sub _confirm_role {
             # Check lsn diff with current standbys if any
             # Use optimized location checking for monitor action
             if ($__OCF_ACTION eq 'monitor') {
-                _check_locations_scaled();
+                _check_locations();
                 _periodic_maintenance(); # Run periodic cleanup
                 _flush_pending_attributes(); # Ensure all updates are sent
             }
@@ -1639,6 +1900,42 @@ sub ocf_meta_data {
                 Additionnal arguments given to the postgres process on startup.
               </shortdesc>
               <content type="string" default="$start_opts_default" />
+            </parameter>
+
+            <parameter name="enable_batching" unique="0" required="0">
+              <longdesc lang="en">
+                Enable batch processing for resource coordination. Recommended for 
+                clusters with 20+ PostgreSQL resources.
+              </longdesc>
+              <shortdesc lang="en">Enable batch processing coordination</shortdesc>
+              <content type="boolean" default="true" />
+            </parameter>
+
+            <parameter name="batch_size" unique="0" required="0">
+              <longdesc lang="en">
+                Maximum number of operations to batch together. Higher values 
+                reduce cluster communication overhead but may increase latency.
+              </longdesc>
+              <shortdesc lang="en">Batch operation size limit</shortdesc>
+              <content type="integer" default="10" />
+            </parameter>
+
+            <parameter name="resource_group" unique="0" required="0">
+              <longdesc lang="en">
+                Resource group identifier for logical partitioning of large clusters.
+                Resources in the same group coordinate more closely.
+              </longdesc>
+              <shortdesc lang="en">Resource group for cluster partitioning</shortdesc>
+              <content type="string" default="default" />
+            </parameter>
+
+            <parameter name="max_election_participants" unique="0" required="0">
+              <longdesc lang="en">
+                Maximum number of nodes participating in leader election.
+                Reduces election overhead in large clusters.
+              </longdesc>
+              <shortdesc lang="en">Maximum election participants</shortdesc>
+              <content type="integer" default="5" />
             </parameter>
 
           </parameters>
@@ -2270,13 +2567,14 @@ sub pgsql_promote {
         return $OCF_ERR_GENERIC;
     }
 
-    # Use hierarchical election for large clusters
-    my $cluster_size = scalar(split /\s+/, qx{ $CRM_NODE --partition });
-    if ($cluster_size > 20) {
-        unless (_coordinate_election()) {
-            return $OCF_ERR_GENERIC; # Better candidate found
-        }
+    # Use batch coordination for election
+    unless (_coordinate_election()) {
+        ocf_log('info', 'Election coordination determined better candidate exists');
+        return $OCF_ERR_GENERIC;
     }
+
+    # Flush any pending batch operations before promotion
+    _flush_pending_attributes();
 
     #
     # At this point, the instance **MUST** be started as a secondary.
