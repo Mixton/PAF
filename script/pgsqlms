@@ -95,7 +95,6 @@ my $attr_cache_ttl = 5; # 5 seconds TTL
 my @pending_attr_updates;
 
 # Add resource grouping support
-my $resource_group = $ENV{'OCF_RESKEY_resource_group'} || 'default';
 my $max_election_participants = $ENV{'OCF_RESKEY_max_election_participants'} || 5;
 
 my $batch_processing_enabled = $ENV{'OCF_RESKEY_enable_batching'} || 'true';
@@ -173,7 +172,10 @@ sub _coordinate_batch_monitoring {
     _batch_set_attributes(\@batch_updates) if @batch_updates;
     
     # Store coordination timestamp
-    _set_priv_attr('last_batch_coordination', time());
+    if (@batch_updates) {
+        _async_set_priv_attr('last_batch_coordination', time());
+        _flush_pending_attributes(); # Ensure it's written immediately
+    }
 
     return $OCF_SUCCESS;
 }
@@ -255,7 +257,7 @@ sub _cleanup_caches {
     my $cluster_size = scalar(split /\s+/, qx{ $CRM_NODE --partition });
     if ($cluster_size > 50) {
         # Perl doesn't have explicit GC, but we can undef large structures
-        undef %db_connections if keys(%db_connections) > 10;
+        %query_cache = () if keys(%query_cache) > 100;
     }
 }
 
@@ -1916,15 +1918,6 @@ sub ocf_meta_data {
               <content type="integer" default="10" />
             </parameter>
 
-            <parameter name="resource_group" unique="0" required="0">
-              <longdesc lang="en">
-                Resource group identifier for logical partitioning of large clusters.
-                Resources in the same group coordinate more closely.
-              </longdesc>
-              <shortdesc lang="en">Resource group for cluster partitioning</shortdesc>
-              <content type="string" default="default" />
-            </parameter>
-
             <parameter name="max_election_participants" unique="0" required="0">
               <longdesc lang="en">
                 Maximum number of nodes participating in leader election.
@@ -2065,6 +2058,32 @@ sub pgsql_validate_all {
             'You must set meta parameter master-max=1 for your "master" resource'
         );
         return $OCF_ERR_INSTALLED;
+    }
+
+    if (defined $ENV{'OCF_RESKEY_enable_batching'}) {
+        unless ($ENV{'OCF_RESKEY_enable_batching'} =~ /^(true|false)$/i) {
+            ocf_exit_reason('enable_batching must be "true" or "false", got: "%s"', 
+                          $ENV{'OCF_RESKEY_enable_batching'});
+            return $OCF_ERR_ARGS;
+        }
+    }
+    
+    if (defined $ENV{'OCF_RESKEY_batch_size'}) {
+        unless (looks_like_number($ENV{'OCF_RESKEY_batch_size'}) && 
+                $ENV{'OCF_RESKEY_batch_size'} > 0) {
+            ocf_exit_reason('batch_size must be a positive number, got: "%s"', 
+                          $ENV{'OCF_RESKEY_batch_size'});
+            return $OCF_ERR_ARGS;
+        }
+    }
+    
+    if (defined $ENV{'OCF_RESKEY_max_election_participants'}) {
+        unless (looks_like_number($ENV{'OCF_RESKEY_max_election_participants'}) && 
+                $ENV{'OCF_RESKEY_max_election_participants'} > 0) {
+            ocf_exit_reason('max_election_participants must be a positive number, got: "%s"', 
+                          $ENV{'OCF_RESKEY_max_election_participants'});
+            return $OCF_ERR_ARGS;
+        }
     }
 
     if ( $PGVERNUM >= $PGVER_12 ) {
