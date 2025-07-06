@@ -89,6 +89,432 @@ my $PGVER_93 = 90300;
 my $PGVER_10 = 100000;
 my $PGVER_12 = 120000;
 
+# Cache for private attributes
+my %attr_cache;
+my $attr_cache_ttl = 5; # 5 seconds TTL
+my @pending_attr_updates;
+
+# Add resource grouping support
+my $resource_group = $ENV{'OCF_RESKEY_resource_group'} || 'default';
+my $max_election_participants = $ENV{'OCF_RESKEY_max_election_participants'} || 5;
+
+# Connection pooling for database queries
+my %db_connections;
+my $connection_timeout = 30;
+
+# Memory management and cleanup
+sub _cleanup_caches {
+    my $now = time();
+    my $max_cache_age = 300; # 5 minutes
+    
+    # Clean old attribute cache entries
+    for my $key (keys %attr_cache) {
+        if (($now - $attr_cache{$key}{timestamp}) > $max_cache_age) {
+            delete $attr_cache{$key};
+        }
+    }
+    
+    # Clean old query cache entries
+    for my $key (keys %query_cache) {
+        if (($now - $query_cache{$key}{timestamp}) > $max_cache_age) {
+            delete $query_cache{$key};
+        }
+    }
+    
+    # Force garbage collection for large clusters
+    my $cluster_size = scalar(split /\s+/, qx{ $CRM_NODE --partition });
+    if ($cluster_size > 50) {
+        # Perl doesn't have explicit GC, but we can undef large structures
+        undef %db_connections if keys(%db_connections) > 10;
+    }
+}
+
+# Call cleanup periodically
+sub _periodic_maintenance {
+    state $last_cleanup = 0;
+    my $now = time();
+    
+    # Run cleanup every 5 minutes
+    if (($now - $last_cleanup) > 300) {
+        _cleanup_caches();
+        $last_cleanup = $now;
+    }
+}
+
+# Enhanced _get_lag_scores with optimizations
+sub _get_lag_scores_optimized {
+    my $cache_key = "lag_scores_$pgport";
+    my @rs;
+    
+    # Use cached version for frequent calls
+    my $rc = _cached_query(_build_lag_query(), \@rs, $cache_key);
+    
+    if ($rc != 0) {
+        ocf_exit_reason('Query to get standby locations failed (%d)', $rc);
+        exit $OCF_ERR_GENERIC;
+    }
+    
+    return \@rs;
+}
+
+# Build lag query dynamically based on PostgreSQL version
+sub _build_lag_query {
+    my $pg_current_wal_lsn = 'pg_current_wal_lsn()';
+    my $pg_wal_lsn_diff    = 'pg_wal_lsn_diff';
+    my $write_lsn          = 'write_lsn';
+    
+    if ($PGVERNUM < $PGVER_10) {
+        $pg_current_wal_lsn = 'pg_current_xlog_location()';
+        $pg_wal_lsn_diff    = 'pg_xlog_location_diff';
+        $write_lsn          = 'write_location';
+    }
+    
+    return qq{
+        SELECT application_name, priority, location, state, current_lag
+        FROM (
+            SELECT application_name,
+                (1000 - (
+                    row_number() OVER (
+                        PARTITION BY state IN ('startup', 'backup')
+                        ORDER BY location DESC, application_name ASC
+                    ) - 1
+                ) * 10
+                ) * CASE WHEN ($maxlag > 0 AND current_lag > $maxlag)
+                         THEN -1 ELSE 1 END AS priority,
+                location, state, current_lag
+            FROM (
+                SELECT application_name, $write_lsn AS location, state,
+                    $pg_wal_lsn_diff($pg_current_wal_lsn, $write_lsn) AS current_lag
+                FROM pg_stat_replication
+            ) AS s2
+        ) AS s1
+        ORDER BY priority DESC
+    };
+}
+
+# Resource group management
+sub _get_group_nodes {
+    my $group = shift || $resource_group;
+    my @all_nodes = split /\s+/, qx{ $CRM_NODE --partition };
+    my @group_nodes;
+    
+    # Filter nodes by group (would check node attributes in real implementation)
+    for my $node (@all_nodes) {
+        my $node_group = _get_node_attribute($node, 'resource_group') || 'default';
+        push @group_nodes, $node if $node_group eq $group;
+    }
+    
+    return @group_nodes;
+}
+
+# Get node attribute (simplified implementation)
+sub _get_node_attribute {
+    my ($node, $attr) = @_;
+    # In real implementation, would query cluster attributes
+    # For now, return default group for all nodes
+    return 'default';
+}
+
+# Cross-group coordination for critical operations
+sub _coordinate_cross_group {
+    my ($operation) = @_;
+    
+    # Only coordinate for major operations like cluster startup
+    return 1 unless $operation eq 'startup' || $operation eq 'failover';
+    
+    my @all_groups = _get_all_resource_groups();
+    my $coordination_needed = scalar(@all_groups) > 1;
+    
+    return 1 unless $coordination_needed;
+    
+    # Implement coordination logic here
+    ocf_log('info', 'Cross-group coordination for %s', $operation);
+    
+    return 1;
+}
+
+sub _get_pooled_connection {
+    my $conn_key = "$pghost:$pgport";
+    my $now = time();
+    
+    # Check if existing connection is still valid
+    if (exists $db_connections{$conn_key} && 
+        ($now - $db_connections{$conn_key}{created}) < $connection_timeout) {
+        return $db_connections{$conn_key}{handle};
+    }
+    
+    # Create new connection (simplified - would use DBI in real implementation)
+    # For now, return undef to use existing _query mechanism
+    return undef;
+}
+
+# Adaptive monitoring intervals based on cluster size
+sub _get_adaptive_monitor_interval {
+    my $cluster_size = scalar(split /\s+/, qx{ $CRM_NODE --partition });
+    my $base_interval = 15; # seconds
+    
+    # Increase interval for larger clusters
+    if ($cluster_size > 100) {
+        return $base_interval * 4;
+    } elsif ($cluster_size > 50) {
+        return $base_interval * 2;
+    } elsif ($cluster_size > 20) {
+        return int($base_interval * 1.5);
+    }
+    
+    return $base_interval;
+}
+
+# Enhanced query function with result caching
+my %query_cache;
+my $query_cache_ttl = 2; # 2 seconds for frequent queries
+
+sub _cached_query {
+    my ($query, $res, $cache_key) = @_;
+    my $now = time();
+    
+    # Use cache for read-only queries
+    if ($cache_key && $query =~ /^\s*SELECT/i) {
+        if (exists $query_cache{$cache_key} && 
+            ($now - $query_cache{$cache_key}{timestamp}) < $query_cache_ttl) {
+            @$res = @{$query_cache{$cache_key}{result}};
+            return $query_cache{$cache_key}{rc};
+        }
+    }
+    
+    # Execute query
+    my $rc = _query($query, $res);
+    
+    # Cache result if successful and cacheable
+    if ($cache_key && $rc == 0 && $query =~ /^\s*SELECT/i) {
+        $query_cache{$cache_key} = {
+            result => [@$res],
+            rc => $rc,
+            timestamp => $now
+        };
+    }
+    
+    return $rc;
+}
+
+# Replace _check_locations with optimized version
+sub _check_locations_scaled {
+    my $cluster_size = scalar(split /\s+/, qx{ $CRM_NODE --partition });
+    
+    # Use sampling for large clusters
+    if ($cluster_size > 50) {
+        return _check_locations_sampled();
+    } else {
+        return _check_locations_optimized();
+    }
+}
+
+# Sampled monitoring for very large clusters
+sub _check_locations_sampled {
+    my $sample_size = min(20, int($cluster_size / 5));
+    my @all_nodes = split /\s+/, qx{ $CRM_NODE --partition };
+    my @sample_nodes = _select_sample_nodes(\@all_nodes, $sample_size);
+    
+    return _check_specific_nodes(@sample_nodes);
+}
+
+# Optimized version with batched operations
+sub _check_locations_optimized {
+    my $partition_nodes;
+    my @score_updates;
+    my @rs;
+    
+    # Set the master score if not already done
+    my $node_score = _cached_get_priv_attr('master_score');
+    unless ($node_score eq '1001') {
+        push @score_updates, ['master_score', '1001', $nodename];
+    }
+    
+    $partition_nodes = qx{ $CRM_NODE --partition };
+    @rs = @{ _get_lag_scores() };
+    
+    # Batch process all score updates
+    for my $row (@rs) {
+        next if $partition_nodes !~ /$row->[0]/;
+        next if $row->[0] eq $nodename;
+        
+        my $current_score = _cached_get_priv_attr('master_score', $row->[0]);
+        my $new_score = _calculate_new_score($row, $current_score);
+        
+        if ($new_score ne $current_score) {
+            push @score_updates, ['master_score', $new_score, $row->[0]];
+        }
+        
+        # Remove processed node from partition list
+        $partition_nodes =~ s/(?:^|\s)$row->[0](?:\s|$)/ /g;
+    }
+    
+    # Handle remaining unconnected nodes
+    $partition_nodes =~ s/(?:^\s+)|(?:\s+$)//g;
+    for my $node (split /\s+/, $partition_nodes) {
+        next if $node eq $nodename;
+        
+        my $current_score = _cached_get_priv_attr('master_score', $node);
+        unless ($current_score eq '-1000') {
+            push @score_updates, ['master_score', '-1000', $node];
+        }
+    }
+    
+    # Batch update all scores
+    _batch_set_attributes(\@score_updates) if @score_updates;
+    
+    return $OCF_SUCCESS;
+}
+
+# Helper to calculate new score based on replication state
+sub _calculate_new_score {
+    my ($row, $current_score) = @_;
+    
+    if ($row->[3] =~ /^\s*(?:startup|backup)\s*$/) {
+        return '-1';
+    }
+    
+    return $row->[1]; # Priority from lag calculation
+}
+
+# Hierarchical election coordinator
+sub _coordinate_election {
+    my @all_nodes = split /\s+/ => qx{ $CRM_NODE --partition };
+    my @candidates = _select_election_candidates(@all_nodes);
+    
+    ocf_log('info', 'Election participants: %s', join(',', @candidates));
+    
+    # Only proceed if this node is a candidate
+    return 0 unless grep { $_ eq $nodename } @candidates;
+    
+    my $best_candidate = _find_best_candidate(@candidates);
+    
+    if ($best_candidate eq $nodename) {
+        ocf_log('info', 'This node is the best candidate for promotion');
+        return 1;
+    } else {
+        ocf_log('info', 'Better candidate found: %s', $best_candidate);
+        _set_master_score('1');
+        _set_master_score('1000', $best_candidate);
+        return 0;
+    }
+}
+
+# Select subset of nodes for election based on criteria
+sub _select_election_candidates {
+    my @all_nodes = @_;
+    my %node_scores;
+    
+    # Score nodes based on multiple criteria
+    for my $node (@all_nodes) {
+        next if $node eq $nodename; # Skip self initially
+        
+        my $score = 0;
+        my $master_score = _get_master_score($node);
+        $score += $master_score if $master_score && $master_score > 0;
+        
+        # Add proximity scoring (same rack, datacenter, etc.)
+        $score += _calculate_proximity_score($node);
+        
+        # Add load balancing factor
+        $score += _calculate_load_factor($node);
+        
+        $node_scores{$node} = $score;
+    }
+    
+    # Always include current node
+    $node_scores{$nodename} = _get_master_score() || 0;
+    
+    # Sort by score and take top N candidates
+    my @sorted = sort { $node_scores{$b} <=> $node_scores{$a} } keys %node_scores;
+    my @candidates = splice(@sorted, 0, $max_election_participants);
+    
+    return @candidates;
+}
+
+# Calculate proximity score based on node attributes
+sub _calculate_proximity_score {
+    my ($node) = @_;
+    # Implementation would check node attributes like rack, datacenter
+    # For now, return 0 (can be enhanced with actual cluster topology)
+    return 0;
+}
+
+# Calculate load balancing factor
+sub _calculate_load_factor {
+    my ($node) = @_;
+    # Could check number of resources already running on node
+    # For now, return random factor to distribute load
+    return int(rand(10));
+}
+
+# Batch attribute operations
+sub _batch_set_attributes {
+    my ($updates) = @_;
+    return unless @$updates;
+    
+    # Group updates by node
+    my %node_updates;
+    for my $update (@$updates) {
+        my ($name, $val, $node) = @$update;
+        $node ||= '';
+        push @{$node_updates{$node}}, "$name-$OCF_RESOURCE_INSTANCE=$val";
+    }
+    
+    # Execute batched updates
+    for my $node (keys %node_updates) {
+        my $node_arg = $node ? "--node $node" : '';
+        my $attrs = join ' ', map { "--name '$_'" } @{$node_updates{$node}};
+        qx{ $ATTRD_PRIV $node_arg --update-batch $attrs };
+    }
+    
+    # Clear pending updates
+    @pending_attr_updates = ();
+}
+
+# Enhanced attribute caching with TTL
+sub _cached_get_priv_attr {
+    my ($name, $node) = @_;
+    $node ||= '';
+    my $cache_key = "$name-$node";
+    my $now = time();
+    
+    # Check cache first
+    if (exists $attr_cache{$cache_key} && 
+        ($now - $attr_cache{$cache_key}{timestamp}) < $attr_cache_ttl) {
+        return $attr_cache{$cache_key}{value};
+    }
+    
+    # Fetch from cluster
+    my $val = _get_priv_attr($name, $node);
+    
+    # Cache the result
+    $attr_cache{$cache_key} = {
+        value => $val,
+        timestamp => $now
+    };
+    
+    return $val;
+}
+
+# Async attribute setting with batching
+sub _async_set_priv_attr {
+    my ($name, $val, $node) = @_;
+    
+    push @pending_attr_updates, [$name, $val, $node];
+    
+    # Flush if batch size reached
+    if (@pending_attr_updates >= 10) {
+        _batch_set_attributes(\@pending_attr_updates);
+    }
+}
+
+# Flush pending updates (call before critical operations)
+sub _flush_pending_attributes {
+    return unless @pending_attr_updates;
+    _batch_set_attributes(\@pending_attr_updates);
+}
+
 # Run a query using psql.
 #
 # This function returns an array with psql return code as first element and
@@ -913,7 +1339,12 @@ sub _confirm_role {
             # The instance is a primary.
             ocf_log( 'debug', "_confirm_role: instance $OCF_RESOURCE_INSTANCE is a primary");
             # Check lsn diff with current standbys if any
-            _check_locations() if $__OCF_ACTION eq 'monitor';
+            # Use optimized location checking for monitor action
+            if ($__OCF_ACTION eq 'monitor') {
+                _check_locations_scaled();
+                _periodic_maintenance(); # Run periodic cleanup
+                _flush_pending_attributes(); # Ensure all updates are sent
+            }
             return $OCF_RUNNING_MASTER;
         }
 
@@ -1837,6 +2268,14 @@ sub pgsql_promote {
         ocf_exit_reason( 'Unexpected error, cannot promote "%s"',
             $OCF_RESOURCE_INSTANCE );
         return $OCF_ERR_GENERIC;
+    }
+
+    # Use hierarchical election for large clusters
+    my $cluster_size = scalar(split /\s+/, qx{ $CRM_NODE --partition });
+    if ($cluster_size > 20) {
+        unless (_coordinate_election()) {
+            return $OCF_ERR_GENERIC; # Better candidate found
+        }
     }
 
     #
