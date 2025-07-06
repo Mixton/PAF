@@ -98,10 +98,6 @@ my @pending_attr_updates;
 my $resource_group = $ENV{'OCF_RESKEY_resource_group'} || 'default';
 my $max_election_participants = $ENV{'OCF_RESKEY_max_election_participants'} || 5;
 
-# Connection pooling for database queries
-my %db_connections;
-my $connection_timeout = 30;
-
 my $batch_processing_enabled = $ENV{'OCF_RESKEY_enable_batching'} || 'true';
 my $batch_size_limit = $ENV{'OCF_RESKEY_batch_size'} || 10;
 
